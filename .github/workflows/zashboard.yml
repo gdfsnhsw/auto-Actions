@@ -121,45 +121,39 @@ jobs:
       - name: Prepare tags
         id: tags
         run: |
-          # 基础镜像名
           IMAGE_FULLNAME="${{ steps.redy.outputs.dockerHubUsername }}/${{ steps.redy.outputs.imageName }}"
           
-          # 标签生成逻辑
           TAGS=()
           IFS=',' read -ra INPUT_TAGS <<< "${{ github.event.inputs.tags }}"
           for tag in "${INPUT_TAGS[@]}"; do
-            # 严格过滤空标签（包括含空格的无效标签）
             if [[ -n "${tag// }" ]]; then
               TAGS+=( "$IMAGE_FULLNAME:$tag" )
             fi
           done
-          
-          # 时间戳标签
-          if [[ "$TIME_TAG_FORMAT" != "不生成时间tag" ]]; then
+          # 增加空值校验和时间标签逻辑优化
+          TIME_TAG_FORMAT="${{ github.event.inputs.timeTagFormat }}"
+          if [[ "$TIME_TAG_FORMAT" != "不生成时间tag" && -n "$TIME_TAG_FORMAT" ]]; then  # 双重校验
             case "$TIME_TAG_FORMAT" in
               "年-月-日_时-分-秒")  FORMAT="%Y-%m-%d_%H-%M-%S" ;;
               "年-月-日_时-分")     FORMAT="%Y-%m-%d_%H-%M" ;;
               "月-日_时-分-秒")    FORMAT="%m-%d_%H-%M-%S" ;;
               "月-日_时-分")       FORMAT="%m-%d_%H-%M" ;;
-              *) echo "未知时间格式: $TIME_TAG_FORMAT"; exit 1 ;;
+              *) 
+                echo "错误：未知时间格式 -> '$TIME_TAG_FORMAT'，可选值：年-月-日_时-分-秒/年-月-日_时-分/月-日_时-分-秒/月-日_时-分"
+                exit 1
+                ;;
             esac
-            
-            # 生成时间戳并校验
             TIMESTAMP=$(date "+$FORMAT")
             if [[ -z "$TIMESTAMP" ]]; then
               echo "时间戳生成失败！"
               exit 1
             fi
-            
-            # 处理时间标签前缀
             TIME_TAG_PREFIX="${{ github.event.inputs.timeTagsPrefix }}"
             if [[ -n "$TIME_TAG_PREFIX" ]]; then
               TIME_TAG="${IMAGE_FULLNAME}:${TIME_TAG_PREFIX}${TIMESTAMP}"
             else
               TIME_TAG="${IMAGE_FULLNAME}:${TIMESTAMP}"
             fi
-            
-            # 确保时间标签不为空
             if [[ -n "${TIME_TAG##*:}" ]]; then
               TAGS+=( "$TIME_TAG" )
             else
@@ -167,8 +161,6 @@ jobs:
               exit 1
             fi
           fi
-          
-          # 将数组转换为逗号分隔的字符串
           echo "tags=$(IFS=,; echo "${TAGS[*]}")" >> $GITHUB_OUTPUT
 
       - name: Build and Push
