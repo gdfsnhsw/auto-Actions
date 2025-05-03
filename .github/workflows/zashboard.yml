@@ -2,7 +2,7 @@ name: '构建zashboard镜像并推送至docker hub'
 
 on:
   schedule:
-    - cron: '0 1 * * *'  # 每天UTC时间1点（北京时间8点）自动触发
+    - cron: '0 0 * * *'  # 每天UTC时间0点（北京时间8点）自动触发
       timezone: Asia/Shanghai
   repository_dispatch:
   workflow_dispatch:
