@@ -143,7 +143,8 @@ jobs:
             TAGS+=( "$IMAGE_FULLNAME:${{ github.event.inputs.timeTagsPrefix }}${TIMESTAMP}" )
           fi
           
-          echo "tags=${TAGS[*]}" >> $GITHUB_OUTPUT
+          # 将数组转换为逗号分隔的字符串
+          echo "tags=$(IFS=,; echo "${TAGS[*]}")" >> $GITHUB_OUTPUT
 
       - name: Build and Push
         uses: docker/build-push-action@v4
