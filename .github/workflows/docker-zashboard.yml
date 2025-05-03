@@ -124,43 +124,38 @@ jobs:
           IMAGE_FULLNAME="${{ steps.redy.outputs.dockerHubUsername }}/${{ steps.redy.outputs.imageName }}"
           
           TAGS=()
-          IFS=',' read -ra INPUT_TAGS <<< "${{ github.event.inputs.tags }}"
+          IFS=',' read -ra INPUT_TAGS <<< "${{ github.event.inputs.tags || 'latest' }}"
           for tag in "${INPUT_TAGS[@]}"; do
             if [[ -n "${tag// }" ]]; then
               TAGS+=( "$IMAGE_FULLNAME:$tag" )
             fi
           done
-          # 增加空值校验和时间标签逻辑优化
-          TIME_TAG_FORMAT="${{ github.event.inputs.timeTagFormat }}"
-          if [[ "$TIME_TAG_FORMAT" != "不生成时间tag" && -n "$TIME_TAG_FORMAT" ]]; then  # 双重校验
+      
+          # 修正变量名：timeTagsFormat
+          TIME_TAG_FORMAT="${{ github.event.inputs.timeTagsFormat }}"
+          if [[ "$TIME_TAG_FORMAT" != "不生成时间tag" && -n "$TIME_TAG_FORMAT" ]]; then
             case "$TIME_TAG_FORMAT" in
               "年-月-日_时-分-秒")  FORMAT="%Y-%m-%d_%H-%M-%S" ;;
               "年-月-日_时-分")     FORMAT="%Y-%m-%d_%H-%M" ;;
               "月-日_时-分-秒")    FORMAT="%m-%d_%H-%M-%S" ;;
               "月-日_时-分")       FORMAT="%m-%d_%H-%M" ;;
               *) 
-                echo "错误：未知时间格式 -> '$TIME_TAG_FORMAT'，可选值：年-月-日_时-分-秒/年-月-日_时-分/月-日_时-分-秒/月-日_时-分"
+                echo "错误：未知时间格式 -> '$TIME_TAG_FORMAT'"
                 exit 1
                 ;;
             esac
             TIMESTAMP=$(date "+$FORMAT")
-            if [[ -z "$TIMESTAMP" ]]; then
-              echo "时间戳生成失败！"
-              exit 1
-            fi
             TIME_TAG_PREFIX="${{ github.event.inputs.timeTagsPrefix }}"
-            if [[ -n "$TIME_TAG_PREFIX" ]]; then
-              TIME_TAG="${IMAGE_FULLNAME}:${TIME_TAG_PREFIX}${TIMESTAMP}"
-            else
-              TIME_TAG="${IMAGE_FULLNAME}:${TIMESTAMP}"
-            fi
-            if [[ -n "${TIME_TAG##*:}" ]]; then
-              TAGS+=( "$TIME_TAG" )
-            else
-              echo "错误：生成的时间标签为空！"
-              exit 1
-            fi
+            TIME_TAG="${IMAGE_FULLNAME}:${TIME_TAG_PREFIX}${TIMESTAMP}"
+            TAGS+=( "$TIME_TAG" )
           fi
+      
+          # 确保至少存在一个tag
+          if [ ${#TAGS[@]} -eq 0 ]; then
+            echo "错误：未生成任何有效的Docker tag！"
+            exit 1
+          fi
+      
           echo "tags=$(IFS=,; echo "${TAGS[*]}")" >> $GITHUB_OUTPUT
 
       - name: Build and Push
