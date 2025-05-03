@@ -128,7 +128,10 @@ jobs:
           TAGS=()
           IFS=',' read -ra INPUT_TAGS <<< "${{ github.event.inputs.tags }}"
           for tag in "${INPUT_TAGS[@]}"; do
-            TAGS+=( "$IMAGE_FULLNAME:$tag" )
+            # 过滤空标签
+            if [[ -n "$tag" ]]; then
+              TAGS+=( "$IMAGE_FULLNAME:$tag" )
+            fi
           done
           
           # 时间戳标签
@@ -140,7 +143,12 @@ jobs:
               "月-日_时-分")       FORMAT="%m-%d_%H-%M" ;;
             esac
             TIMESTAMP=$(date "+$FORMAT")
-            TAGS+=( "$IMAGE_FULLNAME:${{ github.event.inputs.timeTagsPrefix }}${TIMESTAMP}" )
+            # 处理时间标签前缀（允许为空）
+            TIME_TAG="$IMAGE_FULLNAME:${TIMESTAMP}"
+            if [[ -n "${{ github.event.inputs.timeTagsPrefix }}" ]]; then
+              TIME_TAG="$IMAGE_FULLNAME:${{ github.event.inputs.timeTagsPrefix }}${TIMESTAMP}"
+            fi
+            TAGS+=( "$TIME_TAG" )
           fi
           
           # 将数组转换为逗号分隔的字符串
