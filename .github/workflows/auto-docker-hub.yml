@@ -6,10 +6,12 @@ on:
     inputs:
       repoUrl:
         description: 'git仓库克隆url地址'
-        required: true
-      imageName:
+        required: false
+        default: 'https://github.com/Zephyruso/zashboard.git'
+        imageName:
         description: '构建镜像的名称,不填写根据git地址自动生成'
         required: false
+        default: 'zashboard'
       repoBranch :
         description: '指定git分支'
         required: false
@@ -64,7 +66,7 @@ jobs:
          if [[ "${{ github.event.inputs.repoBranch }}" ]] ;then git clone --depth 1 -b "${{ github.event.inputs.repoBranch }}" "${{github.event.inputs.repoUrl}}" . ; else git clone --depth 1 "${{github.event.inputs.repoUrl}}" . ; fi
          if [[ "${{ github.event.inputs.dockerFileUrl }}" ]] ;then wget "${{github.event.inputs.dockerFileUrl}}" -O ./Dockerfile ; fi
          if [[ "${{ github.event.inputs.shellUrl }}" ]] ;then wget "${{github.event.inputs.shellUrl}}" -O /tmp/.customize_shell.sh ; chmod +x /tmp/.customize_shell.sh && /tmp/.customize_shell.sh; fi
-         if [[ "${{ github.event.inputs.shell }}" ]] ;then ""${{github.event.inputs.shell}} ; fi
+         if [[ "${{ github.event.inputs.shell }}" ]] ;then "${{github.event.inputs.shell}}" ; fi
          dockerHubUsername=${{ secrets.DOCKER_HUB_USERNAME }}
          dockerHubPassword=${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
          if [[ "${{ env.DOCKER_HUB_USERNAME }}" ]] ;then dockerHubUsername="${{env.DOCKER_HUB_USERNAME}}" ; fi
