@@ -33,7 +33,7 @@ on:
       timeTagsFormat:
         description: '根据时间自动生成的dockerTag'
         type: choice
-        default: 月-日_时-分-秒
+        default: 不生成时间tag
         options:
           - 不生成时间tag
           - 年-月-日_时-分-秒
