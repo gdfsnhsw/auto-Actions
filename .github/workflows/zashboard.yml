@@ -128,8 +128,8 @@ jobs:
           TAGS=()
           IFS=',' read -ra INPUT_TAGS <<< "${{ github.event.inputs.tags }}"
           for tag in "${INPUT_TAGS[@]}"; do
-            # 过滤空标签
-            if [[ -n "$tag" ]]; then
+            # 严格过滤空标签（包括含空格的无效标签）
+            if [[ -n "${tag// }" ]]; then
               TAGS+=( "$IMAGE_FULLNAME:$tag" )
             fi
           done
@@ -141,14 +141,31 @@ jobs:
               "年-月-日_时-分")     FORMAT="%Y-%m-%d_%H-%M" ;;
               "月-日_时-分-秒")    FORMAT="%m-%d_%H-%M-%S" ;;
               "月-日_时-分")       FORMAT="%m-%d_%H-%M" ;;
+              *) echo "未知时间格式: $TIME_TAG_FORMAT"; exit 1 ;;
             esac
+            
+            # 生成时间戳并校验
             TIMESTAMP=$(date "+$FORMAT")
-            # 处理时间标签前缀（允许为空）
-            TIME_TAG="$IMAGE_FULLNAME:${TIMESTAMP}"
-            if [[ -n "${{ github.event.inputs.timeTagsPrefix }}" ]]; then
-              TIME_TAG="$IMAGE_FULLNAME:${{ github.event.inputs.timeTagsPrefix }}${TIMESTAMP}"
+            if [[ -z "$TIMESTAMP" ]]; then
+              echo "时间戳生成失败！"
+              exit 1
             fi
-            TAGS+=( "$TIME_TAG" )
+            
+            # 处理时间标签前缀
+            TIME_TAG_PREFIX="${{ github.event.inputs.timeTagsPrefix }}"
+            if [[ -n "$TIME_TAG_PREFIX" ]]; then
+              TIME_TAG="${IMAGE_FULLNAME}:${TIME_TAG_PREFIX}${TIMESTAMP}"
+            else
+              TIME_TAG="${IMAGE_FULLNAME}:${TIMESTAMP}"
+            fi
+            
+            # 确保时间标签不为空
+            if [[ -n "${TIME_TAG##*:}" ]]; then
+              TAGS+=( "$TIME_TAG" )
+            else
+              echo "错误：生成的时间标签为空！"
+              exit 1
+            fi
           fi
           
           # 将数组转换为逗号分隔的字符串
