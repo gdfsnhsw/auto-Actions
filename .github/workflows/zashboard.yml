@@ -1,0 +1,159 @@
+name: '构建镜像并推送至docker hub'
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # 每天UTC时间0点（北京时间8点）自动触发
+    timezone: Asia/Shanghai
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      repoUrl:
+        description: 'git仓库克隆url地址'
+        required: false
+        default: 'https://github.com/Zephyruso/zashboard.git'
+      imageName:
+        description: '构建镜像的名称,不填写根据git地址自动生成'
+        required: false
+      repoBranch:
+        description: '指定git分支'
+        required: false
+      dockerFileUrl:
+        description: '自定义DockerFile下载路径,可空'
+        required: false
+      shellUrl:
+        description: '自定义构建前脚本下载路径,可空'
+        required: false
+      shell:
+        description: '构建前运行shell命令,执行mv Dockerfile等操作'
+        required: false
+      platforms:
+        description: '需要构建的平台'
+        required: false
+        default: linux/amd64,linux/arm64/v8
+      tags:
+        description: '自定义dockerTags,多个使用逗号分隔,非dockerhub使用完整tag(例ghcr.io/xxx/xxx)'
+        required: false
+        default: latest
+      timeTagsFormat:
+        description: '根据时间自动生成的dockerTag'
+        type: choice
+        default: 不生成时间tag
+        options:
+          - 不生成时间tag
+          - 年-月-日_时-分-秒
+          - 年-月-日_时-分
+          - 月-日_时-分-秒
+          - 月-日_时-分
+      timeTagsPrefix:
+        description: '根据时间生成Tag的前缀'
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # 定时触发时强制使用的参数
+      AUTO_REPO_URL: 'https://github.com/Zephyruso/zashboard.git'
+      AUTO_IMAGE_NAME: 'zashboard'
+      AUTO_TIME_FORMAT: '不生成时间tag'
+    steps:
+      - name: Check Out
+        uses: actions/checkout@main
+
+      - name: Setup timezone
+        uses: zcong1993/setup-timezone@master
+        with:
+          timezone: Asia/Shanghai
+
+      - name: Git clone
+        id: redy
+        run: |
+          # 清理工作目录
+          rm -rf {*,.[^.]*,..?*}
+          
+          # 参数优先级处理
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            REPO_URL="${{ env.AUTO_REPO_URL }}"
+            IMAGE_NAME="${{ env.AUTO_IMAGE_NAME }}"
+            TIME_TAG_FORMAT="${{ env.AUTO_TIME_FORMAT }}"
+          else
+            REPO_URL="${INPUT_REPO_URL:-${{ env.AUTO_REPO_URL }}}"
+            IMAGE_NAME="${INPUT_IMAGE_NAME:-${{ env.AUTO_IMAGE_NAME }}}"
+            TIME_TAG_FORMAT="${{ github.event.inputs.timeTagsFormat }}"
+          fi
+          
+          # 克隆仓库
+          if [[ -n "${{ github.event.inputs.repoBranch }}" ]]; then
+            git clone --depth 1 -b "${{ github.event.inputs.repoBranch }}" "$REPO_URL" .
+          else
+            git clone --depth 1 "$REPO_URL" .
+          fi
+          
+          # 文件处理
+          if [[ -n "${{ github.event.inputs.dockerFileUrl }}" ]]; then
+            wget "${{ github.event.inputs.dockerFileUrl }}" -O ./Dockerfile
+          fi
+          if [[ -n "${{ github.event.inputs.shellUrl }}" ]]; then
+            wget "${{ github.event.inputs.shellUrl }}" -O /tmp/custom_shell.sh
+            chmod +x /tmp/custom_shell.sh && /tmp/custom_shell.sh
+          fi
+          if [[ -n "${{ github.event.inputs.shell }}" ]]; then
+            eval "${{ github.event.inputs.shell }}"
+          fi
+          
+          # 凭证处理
+          DOCKER_USER="${{ secrets.DOCKER_HUB_USERNAME }}"
+          DOCKER_PWD="${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}"
+          echo "dockerHubUsername=$DOCKER_USER" >> $GITHUB_OUTPUT
+          echo "dockerHubPassword=$DOCKER_PWD" >> $GITHUB_OUTPUT
+          echo "imageName=$IMAGE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Docker login
+        uses: docker/login-action@v2
+        with:
+          username: ${{ steps.redy.outputs.dockerHubUsername }}
+          password: ${{ steps.redy.outputs.dockerHubPassword }}
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Prepare tags
+        id: tags
+        run: |
+          # 基础镜像名
+          IMAGE_FULLNAME="${{ steps.redy.outputs.dockerHubUsername }}/${{ steps.redy.outputs.imageName }}"
+          
+          # 标签生成逻辑
+          TAGS=()
+          IFS=',' read -ra INPUT_TAGS <<< "${{ github.event.inputs.tags }}"
+          for tag in "${INPUT_TAGS[@]}"; do
+            TAGS+=( "$IMAGE_FULLNAME:$tag" )
+          done
+          
+          # 时间戳标签
+          if [[ "$TIME_TAG_FORMAT" != "不生成时间tag" ]]; then
+            case "$TIME_TAG_FORMAT" in
+              "年-月-日_时-分-秒")  FORMAT="%Y-%m-%d_%H-%M-%S" ;;
+              "年-月-日_时-分")     FORMAT="%Y-%m-%d_%H-%M" ;;
+              "月-日_时-分-秒")    FORMAT="%m-%d_%H-%M-%S" ;;
+              "月-日_时-分")       FORMAT="%m-%d_%H-%M" ;;
+            esac
+            TIMESTAMP=$(date "+$FORMAT")
+            TAGS+=( "$IMAGE_FULLNAME:${{ github.event.inputs.timeTagsPrefix }}${TIMESTAMP}" )
+          fi
+          
+          echo "tags=${TAGS[*]}" >> $GITHUB_OUTPUT
+
+      - name: Build and Push
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          platforms: ${{ github.event.inputs.platforms }}
+          tags: ${{ steps.tags.outputs.tags }}
+          push: true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker system prune -a --force
+          rm -rf /tmp/*
