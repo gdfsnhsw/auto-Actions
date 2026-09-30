@@ -1,0 +1,104 @@
+name: '智能追踪上游并自动构建推送 Docker'
+
+on:
+  schedule:
+    # 每天北京时间凌晨 2:00（UTC 18:00）自动检查一次更新
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: '是否强制构建（忽略更新检查直接编译）'
+        type: boolean
+        default: false
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: 'zashboard'
+            repo: 'https://github.com/Zephyruso/zashboard.git'
+            branch: 'main'
+          - name: 'yyb-go-enhanced'
+            repo: 'https://github.com/525815266/YYB-Go-Enhanced.git'
+            branch: 'main'
+          - name: 'wb2api-panel'
+            repo: 'https://github.com/linguo2625469/workbuddy2api-panel.git'
+            branch: 'main'
+
+    steps:
+      - name: Checkout self
+        uses: actions/checkout@v4
+
+      - name: 检查上游更新
+        id: check_update
+        run: |
+          # 获取上游仓库指定分支的最新 commit hash
+          UPSTREAM_SHA=$(git ls-remote "${{ matrix.repo }}" "refs/heads/${{ matrix.branch }}" | awk '{print $1}')
+          
+          # 如果获取不到分支，尝试获取 HEAD
+          if [ -z "$UPSTREAM_SHA" ]; then
+            UPSTREAM_SHA=$(git ls-remote "${{ matrix.repo }}" HEAD | awk '{print $1}')
+          fi
+
+          echo "上游最新 Commit: $UPSTREAM_SHA"
+          echo "upstream_sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
+
+      - name: 读取上次构建记录
+        id: cache_check
+        uses: actions/cache@v4
+        with:
+          path: .last_build_sha_${{ matrix.name }}
+          key: build-cache-${{ matrix.name }}-${{ steps.check_update.outputs.upstream_sha }}
+
+      - name: 判断是否需要构建
+        id: decision
+        run: |
+          FORCE="${{ github.event.inputs.force_build }}"
+          CACHE_HIT="${{ steps.cache_check.outputs.cache-hit }}"
+
+          if [ "$FORCE" = "true" ] || [ "$CACHE_HIT" != "true" ]; then
+            echo "need_build=true" >> $GITHUB_OUTPUT
+            echo "检测到代码更新或手动强制构建，开始执行编译..."
+          else
+            echo "need_build=false" >> $GITHUB_OUTPUT
+            echo "上游无新提交，跳过构建。"
+          fi
+
+      - name: 克隆上游源码
+        if: steps.decision.outputs.need_build == 'true'
+        run: |
+          git clone --depth 1 "${{ matrix.repo }}" ./source_code
+
+      - name: 配置 QEMU 跨架构支持
+        if: steps.decision.outputs.need_build == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: 配置 Docker Buildx
+        if: steps.decision.outputs.need_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 Docker Hub
+        if: steps.decision.outputs.need_build == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: 构建并推送镜像
+        if: steps.decision.outputs.need_build == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: ./source_code
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.name }}:latest
+            ${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.name }}:${{ steps.check_update.outputs.upstream_sha }}
+          push: true
+
+      - name: 更新构建缓存标记
+        if: steps.decision.outputs.need_build == 'true'
+        run: |
+          echo "${{ steps.check_update.outputs.upstream_sha }}" > .last_build_sha_${{ matrix.name }}
