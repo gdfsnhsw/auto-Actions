@@ -1,0 +1,198 @@
+name: '多项目镜像构建并推送至Docker Hub'
+
+on:
+  schedule:
+    - cron: '0 18 * * 1'  # 每周一 UTC 18:00（北京时间次日凌晨 2:00）自动构建默认项目
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      targetProject:
+        description: '选择需要构建的目标项目'
+        type: choice
+        default: 'zashboard'
+        options:
+          - 'zashboard'
+          - 'yyb-go-enhanced'
+          - 'wb2api-panel'
+          - '自定义仓库'
+      repoUrl:
+        description: '若选择“自定义仓库”，在此填入Git克隆地址'
+        required: false
+        default: ''
+      customImageName:
+        description: '若选择“自定义仓库”，在此填入镜像名称'
+        required: false
+        default: ''
+      repoBranch:
+        description: '指定git分支(留空使用默认分支)'
+        required: false
+      dockerFileUrl:
+        description: '自定义DockerFile下载路径,可空'
+        required: false
+      shellUrl:
+        description: '自定义构建前脚本下载路径,可空'
+        required: false
+      shell:
+        description: '构建前运行shell命令'
+        required: false
+      platforms:
+        description: '需要构建的平台'
+        required: false
+        default: 'linux/amd64,linux/arm64'
+      tags:
+        description: '自定义dockerTags,多个使用逗号分隔'
+        required: false
+        default: 'latest'
+      timeTagsFormat:
+        description: '根据时间自动生成的dockerTag'
+        type: choice
+        default: '不生成时间tag'
+        options:
+          - '不生成时间tag'
+          - '年-月-日_时-分-秒'
+          - '年-月-日_时-分'
+          - '月-日_时-分-秒'
+          - '月-日_时-分'
+      timeTagsPrefix:
+        description: '根据时间生成Tag的前缀'
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Out
+        uses: actions/checkout@v4
+
+      - name: Setup timezone
+        uses: zcong1993/setup-timezone@master
+        with:
+          timezone: Asia/Shanghai
+
+      - name: Setup QEMU (跨架构编译支持)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Git clone & 准备源码
+        id: redy
+        run: |
+          # 清理当前目录
+          rm -rf {*,.[^.]*,..?*} 2>/dev/null || true
+
+          # 解析目标项目与仓库地址
+          TARGET="${{ github.event.inputs.targetProject || 'zashboard' }}"
+          
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            REPO_URL="https://github.com/Zephyruso/zashboard.git"
+            IMAGE_NAME="zashboard"
+          else
+            case "$TARGET" in
+              "zashboard")
+                REPO_URL="https://github.com/Zephyruso/zashboard.git"
+                IMAGE_NAME="zashboard"
+                ;;
+              "yyb-go-enhanced")
+                REPO_URL="https://github.com/525815266/YYB-Go-Enhanced.git"
+                IMAGE_NAME="yyb-go-enhanced"
+                ;;
+              "wb2api-panel")
+                REPO_URL="https://github.com/linguo2625469/workbuddy2api-panel.git"
+                IMAGE_NAME="wb2api-panel"
+                ;;
+              "自定义仓库")
+                REPO_URL="${{ github.event.inputs.repoUrl }}"
+                IMAGE_NAME="${{ github.event.inputs.customImageName }}"
+                ;;
+            esac
+          fi
+
+          if [[ -z "$REPO_URL" || -z "$IMAGE_NAME" ]]; then
+            echo "错误：未指定有效的代码仓库地址或镜像名称！"
+            exit 1
+          fi
+
+          echo "正在克隆项目: $IMAGE_NAME ($REPO_URL)"
+
+          # 克隆指定分支或默认分支
+          BRANCH="${{ github.event.inputs.repoBranch }}"
+          if [[ -n "$BRANCH" ]]; then
+            git clone --depth 1 -b "$BRANCH" "$REPO_URL" .
+          else
+            git clone --depth 1 "$REPO_URL" .
+          fi
+
+          # 自定义脚本与 Dockerfile 处理
+          if [[ -n "${{ github.event.inputs.dockerFileUrl }}" ]]; then
+            wget "${{ github.event.inputs.dockerFileUrl }}" -O ./Dockerfile
+          fi
+          if [[ -n "${{ github.event.inputs.shellUrl }}" ]]; then
+            wget "${{ github.event.inputs.shellUrl }}" -O /tmp/custom_shell.sh
+            chmod +x /tmp/custom_shell.sh && /tmp/custom_shell.sh
+          fi
+          if [[ -n "${{ github.event.inputs.shell }}" ]]; then
+            eval "${{ github.event.inputs.shell }}"
+          fi
+
+          # 导出输出变量供后续步骤使用
+          echo "dockerHubUsername=${{ secrets.DOCKER_HUB_USERNAME }}" >> $GITHUB_OUTPUT
+          echo "dockerHubPassword=${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" >> $GITHUB_OUTPUT
+          echo "imageName=$IMAGE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Docker login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ steps.redy.outputs.dockerHubUsername }}
+          password: ${{ steps.redy.outputs.dockerHubPassword }}
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prepare tags
+        id: tags
+        run: |
+          IMAGE_FULLNAME="${{ steps.redy.outputs.dockerHubUsername }}/${{ steps.redy.outputs.imageName }}"
+          
+          TAGS=()
+          INPUT_TAGS_STR="${{ github.event.inputs.tags || 'latest' }}"
+          IFS=',' read -ra INPUT_TAGS <<< "$INPUT_TAGS_STR"
+          for tag in "${INPUT_TAGS[@]}"; do
+            clean_tag="$(echo "$tag" | xargs)"
+            if [[ -n "$clean_tag" ]]; then
+              TAGS+=( "$IMAGE_FULLNAME:$clean_tag" )
+            fi
+          done
+
+          TIME_TAG_FORMAT="${{ github.event.inputs.timeTagsFormat }}"
+          if [[ "$TIME_TAG_FORMAT" != "不生成时间tag" && -n "$TIME_TAG_FORMAT" ]]; then
+            case "$TIME_TAG_FORMAT" in
+              "年-月-日_时-分-秒") FORMAT="%Y-%m-%d_%H-%M-%S" ;;
+              "年-月-日_时-分")     FORMAT="%Y-%m-%d_%H-%M" ;;
+              "月-日_时-分-秒")    FORMAT="%m-%d_%H-%M-%S" ;;
+              "月-日_时-分")       FORMAT="%m-%d_%H-%M" ;;
+              *) 
+                echo "错误：未知时间格式 -> '$TIME_TAG_FORMAT'"
+                exit 1
+                ;;
+            esac
+            TIMESTAMP=$(date "+$FORMAT")
+            PREFIX="${{ github.event.inputs.timeTagsPrefix }}"
+            TAGS+=( "${IMAGE_FULLNAME}:${PREFIX}${TIMESTAMP}" )
+          fi
+
+          if [ ${#TAGS[@]} -eq 0 ]; then
+            echo "错误：未生成任何有效的 Docker tag！"
+            exit 1
+          fi
+
+          echo "tags=$(IFS=,; echo "${TAGS[*]}")" >> $GITHUB_OUTPUT
+
+      - name: Build and Push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: ${{ github.event.inputs.platforms || 'linux/amd64,linux/arm64' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          push: true
+
+      - name: Clean Docker resources
+        if: always()
+        run: docker system prune -a --force
