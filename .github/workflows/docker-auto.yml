@@ -1,164 +1,87 @@
-name: '多项目镜像构建并推送至Docker Hub'
+name: '智能追踪上游并自动构建推送 Docker'
 
 on:
   schedule:
-    - cron: '0 18 * * 1'  # 每周一 UTC 18:00（北京时间次日凌晨 2:00）自动构建默认项目
-  repository_dispatch:
+    # 每天北京时间凌晨 2:00（UTC 18:00）自动检查一次更新
+    - cron: '0 18 * * *'
   workflow_dispatch:
     inputs:
-      targetProject:
-        description: '选择需要构建的目标项目'
-        type: choice
-        default: 'zashboard'
-        options:
-          - 'zashboard'
-          - 'yyb-go-enhanced'
-          - 'wb2api-panel'
-          - '自定义仓库'
-      repoUrl:
-        description: '若选择“自定义仓库”，在此填入Git克隆地址'
-        required: false
-        default: ''
-      customImageName:
-        description: '若选择“自定义仓库”，在此填入镜像名称'
-        required: false
-        default: ''
-      repoBranch:
-        description: '指定git分支(留空使用默认分支)'
-        required: false
-      dockerFileUrl:
-        description: '自定义DockerFile下载路径,可空'
-        required: false
-      shellUrl:
-        description: '自定义构建前脚本下载路径,可空'
-        required: false
-      shell:
-        description: '构建前运行shell命令'
-        required: false
-      platforms:
-        description: '需要构建的平台'
-        required: false
-        default: 'linux/amd64,linux/arm64'
-      tags:
-        description: '自定义dockerTags,多个使用逗号分隔'
-        required: false
-        default: 'latest'
-      versionTag:
-        description: '版本号Tag: 从源码自动读取版本号作为tag (v版本号→v0.2.25 / 纯版本号→0.2.25)'
-        type: choice
-        default: 'v版本号'
-        options:
-          - 'v版本号'
-          - '纯版本号'
-          - '不生成'
-      fallbackShortSha:
-        description: '读不到版本号时,回退生成短SHA tag(如 sha-b70d02d)'
+      force_build:
+        description: '是否强制构建（忽略更新检查直接编译）'
         type: boolean
-        default: true
-      timeTagsFormat:
-        description: '根据时间自动生成的dockerTag'
-        type: choice
-        default: '不生成时间tag'
-        options:
-          - '不生成时间tag'
-          - '年-月-日_时-分-秒'
-          - '年-月-日_时-分'
-          - '月-日_时-分-秒'
-          - '月-日_时-分'
-      timeTagsPrefix:
-        description: '根据时间生成Tag的前缀'
-        required: false
+        default: false
 
 jobs:
-  build:
+  check-and-build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: 'zashboard'
+            repo: 'https://github.com/Zephyruso/zashboard.git'
+            branch: 'main'
+          - name: 'yyb-go-enhanced'
+            repo: 'https://github.com/525815266/YYB-Go-Enhanced.git'
+            branch: 'main'
+          - name: 'wb2api-panel'
+            repo: 'https://github.com/linguo2625469/workbuddy2api-panel.git'
+            branch: 'main'
+
     steps:
-      - name: Check Out
+      - name: Checkout self
         uses: actions/checkout@v4
 
-      - name: Setup timezone
-        uses: zcong1993/setup-timezone@master
+      - name: 检查上游更新
+        id: check_update
+        run: |
+          # 获取上游仓库指定分支的最新 commit hash
+          UPSTREAM_SHA=$(git ls-remote "${{ matrix.repo }}" "refs/heads/${{ matrix.branch }}" | awk '{print $1}')
+
+          # 如果获取不到分支，尝试获取 HEAD
+          if [ -z "$UPSTREAM_SHA" ]; then
+            UPSTREAM_SHA=$(git ls-remote "${{ matrix.repo }}" HEAD | awk '{print $1}')
+          fi
+
+          echo "上游最新 Commit: $UPSTREAM_SHA"
+          echo "upstream_sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
+          echo "upstream_sha_short=${UPSTREAM_SHA:0:7}" >> $GITHUB_OUTPUT
+
+      - name: 读取上次构建记录
+        id: cache_check
+        uses: actions/cache@v4
         with:
-          timezone: Asia/Shanghai
+          path: .last_build_sha_${{ matrix.name }}
+          key: build-cache-${{ matrix.name }}-${{ steps.check_update.outputs.upstream_sha }}
 
-      - name: Setup QEMU (跨架构编译支持)
-        uses: docker/setup-qemu-action@v3
+      - name: 判断是否需要构建
+        id: decision
+        run: |
+          FORCE="${{ github.event.inputs.force_build }}"
+          CACHE_HIT="${{ steps.cache_check.outputs.cache-hit }}"
 
-      - name: Git clone & 准备源码
-        id: redy
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          TARGET_PROJECT: ${{ github.event.inputs.targetProject }}
-          INPUT_REPO_URL: ${{ github.event.inputs.repoUrl }}
-          INPUT_IMAGE_NAME: ${{ github.event.inputs.customImageName }}
-          INPUT_BRANCH: ${{ github.event.inputs.repoBranch }}
-          INPUT_DOCKERFILE_URL: ${{ github.event.inputs.dockerFileUrl }}
-          INPUT_SHELL_URL: ${{ github.event.inputs.shellUrl }}
-          INPUT_SHELL: ${{ github.event.inputs.shell }}
-          DOCKER_USER: ${{ secrets.DOCKER_HUB_USERNAME }}
+          if [ "$FORCE" = "true" ] || [ "$CACHE_HIT" != "true" ]; then
+            echo "need_build=true" >> $GITHUB_OUTPUT
+            echo "检测到代码更新或手动强制构建，开始执行编译..."
+          else
+            echo "need_build=false" >> $GITHUB_OUTPUT
+            echo "上游无新提交，跳过构建。"
+          fi
+
+      - name: 克隆上游源码
+        if: steps.decision.outputs.need_build == 'true'
+        run: |
+          git clone --depth 1 "${{ matrix.repo }}" ./source_code
+          # 浅克隆默认不拉 tag，补一次（失败不影响后续）
+          cd ./source_code && git fetch --tags --depth=1 origin 2>/dev/null || true
+
+      - name: 探测源码版本号
+        id: version
+        if: steps.decision.outputs.need_build == 'true'
+        working-directory: ./source_code
         run: |
           set -euo pipefail
 
-          # 清理当前目录
-          rm -rf {*,.[^.]*,..?*} 2>/dev/null || true
-
-          # 解析目标项目与仓库地址
-          TARGET="${TARGET_PROJECT:-zashboard}"
-
-          if [[ "$EVENT_NAME" == "schedule" ]]; then
-            REPO_URL="https://github.com/Zephyruso/zashboard.git"
-            IMAGE_NAME="zashboard"
-          else
-            case "$TARGET" in
-              "zashboard")
-                REPO_URL="https://github.com/Zephyruso/zashboard.git"
-                IMAGE_NAME="zashboard"
-                ;;
-              "yyb-go-enhanced")
-                REPO_URL="https://github.com/525815266/YYB-Go-Enhanced.git"
-                IMAGE_NAME="yyb-go-enhanced"
-                ;;
-              "wb2api-panel")
-                REPO_URL="https://github.com/linguo2625469/workbuddy2api-panel.git"
-                IMAGE_NAME="wb2api-panel"
-                ;;
-              "自定义仓库")
-                REPO_URL="${INPUT_REPO_URL}"
-                IMAGE_NAME="${INPUT_IMAGE_NAME}"
-                ;;
-            esac
-          fi
-
-          if [[ -z "$REPO_URL" || -z "$IMAGE_NAME" ]]; then
-            echo "错误：未指定有效的代码仓库地址或镜像名称！" >&2
-            exit 1
-          fi
-
-          echo "正在克隆项目: $IMAGE_NAME ($REPO_URL)"
-
-          # 克隆指定分支或默认分支
-          if [[ -n "${INPUT_BRANCH}" ]]; then
-            git clone --depth 1 -b "${INPUT_BRANCH}" "$REPO_URL" .
-          else
-            git clone --depth 1 "$REPO_URL" .
-          fi
-
-          # 浅克隆默认不拉 tag，这里补一次（失败不影响后续流程）
-          git fetch --tags --depth=1 origin 2>/dev/null || true
-
-          # 自定义脚本与 Dockerfile 处理
-          if [[ -n "${INPUT_DOCKERFILE_URL}" ]]; then
-            wget "${INPUT_DOCKERFILE_URL}" -O ./Dockerfile
-          fi
-          if [[ -n "${INPUT_SHELL_URL}" ]]; then
-            wget "${INPUT_SHELL_URL}" -O /tmp/custom_shell.sh
-            chmod +x /tmp/custom_shell.sh && /tmp/custom_shell.sh
-          fi
-          if [[ -n "${INPUT_SHELL}" ]]; then
-            eval "${INPUT_SHELL}"
-          fi
-
-          # ===== 自动探测源码版本号 =====
           detect_version() {
             local f v
 
@@ -170,7 +93,7 @@ jobs:
               fi
             done
 
-            # 2) Node 项目 package.json（zashboard 用这个）
+            # 2) Node 项目 package.json（zashboard 用这个：3.29.1）
             if [[ -f package.json ]]; then
               v="$(sed -nE 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' package.json | head -n1)"
               if [[ -n "$v" ]]; then printf '%s' "$v"; return 0; fi
@@ -217,115 +140,41 @@ jobs:
           SOURCE_VERSION="${SOURCE_VERSION#V}"
 
           if [[ -n "$SOURCE_VERSION" ]]; then
-            echo "已探测到源码版本号: $SOURCE_VERSION"
+            echo "version_tag=v${SOURCE_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "已探测到版本号 -> v${SOURCE_VERSION}"
           else
-            echo "未探测到版本号，将按配置回退"
+            SHORT_SHA="${{ steps.check_update.outputs.upstream_sha_short }}"
+            echo "version_tag=sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+            echo "未探测到版本号，回退为短 SHA -> sha-${SHORT_SHA}"
           fi
 
-          # 导出输出变量供后续步骤使用
-          echo "dockerHubUsername=${DOCKER_USER}" >> "$GITHUB_OUTPUT"
-          echo "imageName=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
-          echo "sourceVersion=${SOURCE_VERSION}" >> "$GITHUB_OUTPUT"
+      - name: 配置 QEMU 跨架构支持
+        if: steps.decision.outputs.need_build == 'true'
+        uses: docker/setup-qemu-action@v3
 
-      - name: Docker login
+      - name: 配置 Docker Buildx
+        if: steps.decision.outputs.need_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 Docker Hub
+        if: steps.decision.outputs.need_build == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
 
-      - name: Setup Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Prepare tags
-        id: tags
-        env:
-          DOCKER_USER: ${{ steps.redy.outputs.dockerHubUsername }}
-          IMAGE_NAME: ${{ steps.redy.outputs.imageName }}
-          SOURCE_VERSION: ${{ steps.redy.outputs.sourceVersion }}
-          INPUT_TAGS: ${{ github.event.inputs.tags }}
-          VERSION_TAG_MODE: ${{ github.event.inputs.versionTag }}
-          FALLBACK_SHORT_SHA: ${{ github.event.inputs.fallbackShortSha }}
-          TIME_TAG_FORMAT: ${{ github.event.inputs.timeTagsFormat }}
-          TIME_TAG_PREFIX: ${{ github.event.inputs.timeTagsPrefix }}
-        run: |
-          set -euo pipefail
-
-          IMAGE_FULLNAME="${DOCKER_USER}/${IMAGE_NAME}"
-          TAGS=()
-
-          # ---- 1) 用户自定义 tags（默认 latest） ----
-          INPUT_TAGS_STR="${INPUT_TAGS:-latest}"
-          IFS=',' read -ra _tags <<< "$INPUT_TAGS_STR" || true
-          for tag in "${_tags[@]}"; do
-            clean_tag="$(echo "$tag" | xargs)"
-            if [[ -n "$clean_tag" ]]; then
-              TAGS+=( "${IMAGE_FULLNAME}:${clean_tag}" )
-            fi
-          done
-
-          # ---- 2) 版本号 tag（核心改动） ----
-          VERSION_TAG_MODE="${VERSION_TAG_MODE:-v版本号}"
-          if [[ -n "${SOURCE_VERSION}" ]]; then
-            case "$VERSION_TAG_MODE" in
-              "v版本号")
-                TAGS+=( "${IMAGE_FULLNAME}:v${SOURCE_VERSION}" )
-                echo "已生成版本号 tag: v${SOURCE_VERSION}"
-                ;;
-              "纯版本号")
-                TAGS+=( "${IMAGE_FULLNAME}:${SOURCE_VERSION}" )
-                echo "已生成版本号 tag: ${SOURCE_VERSION}"
-                ;;
-              *)
-                echo "按配置跳过版本号 tag"
-                ;;
-            esac
-          else
-            # 源码里没有版本号 → 可选回退为短 SHA
-            if [[ "${FALLBACK_SHORT_SHA:-true}" != "false" ]]; then
-              SHORT_SHA="$(git rev-parse --short HEAD)"
-              TAGS+=( "${IMAGE_FULLNAME}:sha-${SHORT_SHA}" )
-              echo "未找到版本号，已回退生成短 SHA tag: sha-${SHORT_SHA}"
-            fi
-          fi
-
-          # ---- 3) 时间戳 tag ----
-          TIME_TAG_FORMAT="${TIME_TAG_FORMAT:-不生成时间tag}"
-          if [[ "$TIME_TAG_FORMAT" != "不生成时间tag" && -n "$TIME_TAG_FORMAT" ]]; then
-            case "$TIME_TAG_FORMAT" in
-              "年-月-日_时-分-秒") FORMAT="%Y-%m-%d_%H-%M-%S" ;;
-              "年-月-日_时-分")     FORMAT="%Y-%m-%d_%H-%M" ;;
-              "月-日_时-分-秒")     FORMAT="%m-%d_%H-%M-%S" ;;
-              "月-日_时-分")        FORMAT="%m-%d_%H-%M" ;;
-              *)
-                echo "错误：未知时间格式 -> '$TIME_TAG_FORMAT'" >&2
-                exit 1
-                ;;
-            esac
-            TIMESTAMP="$(date "+$FORMAT")"
-            TAGS+=( "${IMAGE_FULLNAME}:${TIME_TAG_PREFIX}${TIMESTAMP}" )
-          fi
-
-          # ---- 去重 ----
-          mapfile -t UNIQUE_TAGS < <(printf '%s\n' "${TAGS[@]}" | awk '!seen[$0]++')
-
-          if [[ ${#UNIQUE_TAGS[@]} -eq 0 ]]; then
-            echo "错误：未生成任何有效的 Docker tag！" >&2
-            exit 1
-          fi
-
-          echo "最终 tag 列表:"
-          printf '  - %s\n' "${UNIQUE_TAGS[@]}"
-
-          echo "tags=$(IFS=,; echo "${UNIQUE_TAGS[*]}")" >> "$GITHUB_OUTPUT"
-
-      - name: Build and Push
+      - name: 构建并推送镜像
+        if: steps.decision.outputs.need_build == 'true'
         uses: docker/build-push-action@v5
         with:
-          context: .
-          platforms: ${{ github.event.inputs.platforms || 'linux/amd64,linux/arm64' }}
-          tags: ${{ steps.tags.outputs.tags }}
+          context: ./source_code
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.name }}:latest
+            ${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.name }}:${{ steps.version.outputs.version_tag }}
           push: true
 
-      - name: Clean Docker resources
-        if: always()
-        run: docker system prune -a --force
+      - name: 更新构建缓存标记
+        if: steps.decision.outputs.need_build == 'true'
+        run: |
+          echo "${{ steps.check_update.outputs.upstream_sha }}" > .last_build_sha_${{ matrix.name }}
