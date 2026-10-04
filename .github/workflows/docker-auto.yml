@@ -43,6 +43,18 @@ on:
         description: '自定义dockerTags,多个使用逗号分隔'
         required: false
         default: 'latest'
+      versionTag:
+        description: '版本号Tag: 从源码自动读取版本号作为tag (v版本号→v0.2.25 / 纯版本号→0.2.25)'
+        type: choice
+        default: 'v版本号'
+        options:
+          - 'v版本号'
+          - '纯版本号'
+          - '不生成'
+      fallbackShortSha:
+        description: '读不到版本号时,回退生成短SHA tag(如 sha-b70d02d)'
+        type: boolean
+        default: true
       timeTagsFormat:
         description: '根据时间自动生成的dockerTag'
         type: choice
@@ -74,14 +86,26 @@ jobs:
 
       - name: Git clone & 准备源码
         id: redy
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TARGET_PROJECT: ${{ github.event.inputs.targetProject }}
+          INPUT_REPO_URL: ${{ github.event.inputs.repoUrl }}
+          INPUT_IMAGE_NAME: ${{ github.event.inputs.customImageName }}
+          INPUT_BRANCH: ${{ github.event.inputs.repoBranch }}
+          INPUT_DOCKERFILE_URL: ${{ github.event.inputs.dockerFileUrl }}
+          INPUT_SHELL_URL: ${{ github.event.inputs.shellUrl }}
+          INPUT_SHELL: ${{ github.event.inputs.shell }}
+          DOCKER_USER: ${{ secrets.DOCKER_HUB_USERNAME }}
         run: |
+          set -euo pipefail
+
           # 清理当前目录
           rm -rf {*,.[^.]*,..?*} 2>/dev/null || true
 
           # 解析目标项目与仓库地址
-          TARGET="${{ github.event.inputs.targetProject || 'zashboard' }}"
-          
-          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+          TARGET="${TARGET_PROJECT:-zashboard}"
+
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
             REPO_URL="https://github.com/Zephyruso/zashboard.git"
             IMAGE_NAME="zashboard"
           else
@@ -99,91 +123,200 @@ jobs:
                 IMAGE_NAME="wb2api-panel"
                 ;;
               "自定义仓库")
-                REPO_URL="${{ github.event.inputs.repoUrl }}"
-                IMAGE_NAME="${{ github.event.inputs.customImageName }}"
+                REPO_URL="${INPUT_REPO_URL}"
+                IMAGE_NAME="${INPUT_IMAGE_NAME}"
                 ;;
             esac
           fi
 
           if [[ -z "$REPO_URL" || -z "$IMAGE_NAME" ]]; then
-            echo "错误：未指定有效的代码仓库地址或镜像名称！"
+            echo "错误：未指定有效的代码仓库地址或镜像名称！" >&2
             exit 1
           fi
 
           echo "正在克隆项目: $IMAGE_NAME ($REPO_URL)"
 
           # 克隆指定分支或默认分支
-          BRANCH="${{ github.event.inputs.repoBranch }}"
-          if [[ -n "$BRANCH" ]]; then
-            git clone --depth 1 -b "$BRANCH" "$REPO_URL" .
+          if [[ -n "${INPUT_BRANCH}" ]]; then
+            git clone --depth 1 -b "${INPUT_BRANCH}" "$REPO_URL" .
           else
             git clone --depth 1 "$REPO_URL" .
           fi
 
+          # 浅克隆默认不拉 tag，这里补一次（失败不影响后续流程）
+          git fetch --tags --depth=1 origin 2>/dev/null || true
+
           # 自定义脚本与 Dockerfile 处理
-          if [[ -n "${{ github.event.inputs.dockerFileUrl }}" ]]; then
-            wget "${{ github.event.inputs.dockerFileUrl }}" -O ./Dockerfile
+          if [[ -n "${INPUT_DOCKERFILE_URL}" ]]; then
+            wget "${INPUT_DOCKERFILE_URL}" -O ./Dockerfile
           fi
-          if [[ -n "${{ github.event.inputs.shellUrl }}" ]]; then
-            wget "${{ github.event.inputs.shellUrl }}" -O /tmp/custom_shell.sh
+          if [[ -n "${INPUT_SHELL_URL}" ]]; then
+            wget "${INPUT_SHELL_URL}" -O /tmp/custom_shell.sh
             chmod +x /tmp/custom_shell.sh && /tmp/custom_shell.sh
           fi
-          if [[ -n "${{ github.event.inputs.shell }}" ]]; then
-            eval "${{ github.event.inputs.shell }}"
+          if [[ -n "${INPUT_SHELL}" ]]; then
+            eval "${INPUT_SHELL}"
+          fi
+
+          # ===== 自动探测源码版本号 =====
+          detect_version() {
+            local f v
+
+            # 1) 根目录版本文件（YYB-Go-Enhanced 用这个：VERSION 内容为 0.2.25）
+            for f in VERSION VERSION.txt version.txt version .version; do
+              if [[ -f "$f" ]]; then
+                v="$(tr -d '[:space:]' < "$f")"
+                if [[ -n "$v" ]]; then printf '%s' "$v"; return 0; fi
+              fi
+            done
+
+            # 2) Node 项目 package.json（zashboard 用这个）
+            if [[ -f package.json ]]; then
+              v="$(sed -nE 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' package.json | head -n1)"
+              if [[ -n "$v" ]]; then printf '%s' "$v"; return 0; fi
+            fi
+
+            # 3) Python 项目 pyproject.toml
+            if [[ -f pyproject.toml ]]; then
+              v="$(sed -nE 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' pyproject.toml | head -n1)"
+              if [[ -n "$v" ]]; then printf '%s' "$v"; return 0; fi
+            fi
+
+            # 4) Rust 项目 Cargo.toml
+            if [[ -f Cargo.toml ]]; then
+              v="$(sed -nE 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' Cargo.toml | head -n1)"
+              if [[ -n "$v" ]]; then printf '%s' "$v"; return 0; fi
+            fi
+
+            # 5) Go 项目：appVersion 常量最精确（wb2api-panel 用这个：1.11.11-panel）
+            v="$(grep -rhoE 'appVersion[[:space:]]*=[[:space:]]*"[^"]+"' --include='*.go' --exclude='*_test.go' --exclude-dir=vendor . 2>/dev/null | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')"
+            if [[ -n "$v" ]]; then printf '%s' "$v"; return 0; fi
+
+            # 5b) Go 项目：独立的 Version 常量
+            #     前缀 [^A-Za-z0-9_] 是词边界，用来排除 ClientVersion / CliVersion 这类误匹配
+            v="$(grep -rhoE '(^|[^A-Za-z0-9_])[Vv]ersion[[:space:]]*=[[:space:]]*"[^"]+"' --include='*.go' --exclude='*_test.go' --exclude-dir=vendor . 2>/dev/null | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')"
+            if [[ -n "$v" ]]; then printf '%s' "$v"; return 0; fi
+
+            # 6) C/C++ 项目的 version.h
+            for f in version.h VERSION.h; do
+              if [[ -f "$f" ]]; then
+                v="$(grep -m1 -oE '[Vv]ersion[[:space:]]+"[^"]+"' "$f" | sed -E 's/.*"([^"]+)".*/\1/')"
+                if [[ -n "$v" ]]; then printf '%s' "$v"; return 0; fi
+              fi
+            done
+
+            # 7) 最近的 git tag（如 v0.2.25）
+            v="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+            if [[ -n "$v" ]]; then printf '%s' "$v"; return 0; fi
+
+            return 1
+          }
+
+          SOURCE_VERSION="$(detect_version || true)"
+          SOURCE_VERSION="${SOURCE_VERSION#v}"
+          SOURCE_VERSION="${SOURCE_VERSION#V}"
+
+          if [[ -n "$SOURCE_VERSION" ]]; then
+            echo "已探测到源码版本号: $SOURCE_VERSION"
+          else
+            echo "未探测到版本号，将按配置回退"
           fi
 
           # 导出输出变量供后续步骤使用
-          echo "dockerHubUsername=${{ secrets.DOCKER_HUB_USERNAME }}" >> $GITHUB_OUTPUT
-          echo "dockerHubPassword=${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" >> $GITHUB_OUTPUT
-          echo "imageName=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "dockerHubUsername=${DOCKER_USER}" >> "$GITHUB_OUTPUT"
+          echo "imageName=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "sourceVersion=${SOURCE_VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Docker login
         uses: docker/login-action@v3
         with:
-          username: ${{ steps.redy.outputs.dockerHubUsername }}
-          password: ${{ steps.redy.outputs.dockerHubPassword }}
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
 
       - name: Setup Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Prepare tags
         id: tags
+        env:
+          DOCKER_USER: ${{ steps.redy.outputs.dockerHubUsername }}
+          IMAGE_NAME: ${{ steps.redy.outputs.imageName }}
+          SOURCE_VERSION: ${{ steps.redy.outputs.sourceVersion }}
+          INPUT_TAGS: ${{ github.event.inputs.tags }}
+          VERSION_TAG_MODE: ${{ github.event.inputs.versionTag }}
+          FALLBACK_SHORT_SHA: ${{ github.event.inputs.fallbackShortSha }}
+          TIME_TAG_FORMAT: ${{ github.event.inputs.timeTagsFormat }}
+          TIME_TAG_PREFIX: ${{ github.event.inputs.timeTagsPrefix }}
         run: |
-          IMAGE_FULLNAME="${{ steps.redy.outputs.dockerHubUsername }}/${{ steps.redy.outputs.imageName }}"
-          
+          set -euo pipefail
+
+          IMAGE_FULLNAME="${DOCKER_USER}/${IMAGE_NAME}"
           TAGS=()
-          INPUT_TAGS_STR="${{ github.event.inputs.tags || 'latest' }}"
-          IFS=',' read -ra INPUT_TAGS <<< "$INPUT_TAGS_STR"
-          for tag in "${INPUT_TAGS[@]}"; do
+
+          # ---- 1) 用户自定义 tags（默认 latest） ----
+          INPUT_TAGS_STR="${INPUT_TAGS:-latest}"
+          IFS=',' read -ra _tags <<< "$INPUT_TAGS_STR" || true
+          for tag in "${_tags[@]}"; do
             clean_tag="$(echo "$tag" | xargs)"
             if [[ -n "$clean_tag" ]]; then
-              TAGS+=( "$IMAGE_FULLNAME:$clean_tag" )
+              TAGS+=( "${IMAGE_FULLNAME}:${clean_tag}" )
             fi
           done
 
-          TIME_TAG_FORMAT="${{ github.event.inputs.timeTagsFormat }}"
+          # ---- 2) 版本号 tag（核心改动） ----
+          VERSION_TAG_MODE="${VERSION_TAG_MODE:-v版本号}"
+          if [[ -n "${SOURCE_VERSION}" ]]; then
+            case "$VERSION_TAG_MODE" in
+              "v版本号")
+                TAGS+=( "${IMAGE_FULLNAME}:v${SOURCE_VERSION}" )
+                echo "已生成版本号 tag: v${SOURCE_VERSION}"
+                ;;
+              "纯版本号")
+                TAGS+=( "${IMAGE_FULLNAME}:${SOURCE_VERSION}" )
+                echo "已生成版本号 tag: ${SOURCE_VERSION}"
+                ;;
+              *)
+                echo "按配置跳过版本号 tag"
+                ;;
+            esac
+          else
+            # 源码里没有版本号 → 可选回退为短 SHA
+            if [[ "${FALLBACK_SHORT_SHA:-true}" != "false" ]]; then
+              SHORT_SHA="$(git rev-parse --short HEAD)"
+              TAGS+=( "${IMAGE_FULLNAME}:sha-${SHORT_SHA}" )
+              echo "未找到版本号，已回退生成短 SHA tag: sha-${SHORT_SHA}"
+            fi
+          fi
+
+          # ---- 3) 时间戳 tag ----
+          TIME_TAG_FORMAT="${TIME_TAG_FORMAT:-不生成时间tag}"
           if [[ "$TIME_TAG_FORMAT" != "不生成时间tag" && -n "$TIME_TAG_FORMAT" ]]; then
             case "$TIME_TAG_FORMAT" in
               "年-月-日_时-分-秒") FORMAT="%Y-%m-%d_%H-%M-%S" ;;
               "年-月-日_时-分")     FORMAT="%Y-%m-%d_%H-%M" ;;
-              "月-日_时-分-秒")    FORMAT="%m-%d_%H-%M-%S" ;;
-              "月-日_时-分")       FORMAT="%m-%d_%H-%M" ;;
-              *) 
-                echo "错误：未知时间格式 -> '$TIME_TAG_FORMAT'"
+              "月-日_时-分-秒")     FORMAT="%m-%d_%H-%M-%S" ;;
+              "月-日_时-分")        FORMAT="%m-%d_%H-%M" ;;
+              *)
+                echo "错误：未知时间格式 -> '$TIME_TAG_FORMAT'" >&2
                 exit 1
                 ;;
             esac
-            TIMESTAMP=$(date "+$FORMAT")
-            PREFIX="${{ github.event.inputs.timeTagsPrefix }}"
-            TAGS+=( "${IMAGE_FULLNAME}:${PREFIX}${TIMESTAMP}" )
+            TIMESTAMP="$(date "+$FORMAT")"
+            TAGS+=( "${IMAGE_FULLNAME}:${TIME_TAG_PREFIX}${TIMESTAMP}" )
           fi
 
-          if [ ${#TAGS[@]} -eq 0 ]; then
-            echo "错误：未生成任何有效的 Docker tag！"
+          # ---- 去重 ----
+          mapfile -t UNIQUE_TAGS < <(printf '%s\n' "${TAGS[@]}" | awk '!seen[$0]++')
+
+          if [[ ${#UNIQUE_TAGS[@]} -eq 0 ]]; then
+            echo "错误：未生成任何有效的 Docker tag！" >&2
             exit 1
           fi
 
-          echo "tags=$(IFS=,; echo "${TAGS[*]}")" >> $GITHUB_OUTPUT
+          echo "最终 tag 列表:"
+          printf '  - %s\n' "${UNIQUE_TAGS[@]}"
+
+          echo "tags=$(IFS=,; echo "${UNIQUE_TAGS[*]}")" >> "$GITHUB_OUTPUT"
 
       - name: Build and Push
         uses: docker/build-push-action@v5
